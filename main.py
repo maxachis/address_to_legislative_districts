@@ -1,17 +1,83 @@
+import os
 import re
+import time
 from typing import Optional
 import pandas as pd
 
 import requests
 from pydantic import BaseModel
+from requests import HTTPError
 from tqdm import tqdm
 
-API_KEY = 'AIzaSyARlIFVBPzqb8qW3696iPT2dwMZNRxbdsk'
+API_KEY = os.getenv("GOOGLE_API_KEY")
 BASE_URL = 'https://www.googleapis.com/civicinfo/v2/representatives'
 
 STATE_HOUSE_ID = 'sldl'
 STATE_SENATE_ID = 'sldu'
 US_HOUSE_ID = 'cd:'
+
+TOO_MANY_REQUESTS_STATUS_CODE = 429
+
+
+import signal
+
+should_stop = False
+
+def handle_sigint(signum, frame):
+    global should_stop
+    print("Caught Ctrl+C, will stop soon.")
+    should_stop = True
+
+signal.signal(signal.SIGINT, handle_sigint)
+
+class AdaptiveRateLimiter:
+    def __init__(self, initial_delay=1.0, initial_alpha=2, max_delay=30.0, min_delay=0.1):
+        self.delay = initial_delay
+        self.initial_alpha = initial_alpha
+        self.update_count = 0
+        self.max_delay = max_delay
+        self.min_delay = min_delay
+
+    def _compute_alpha(self):
+        return self.initial_alpha / (1 + self.update_count)
+
+    def _apply_ema(self, new_target):
+        self.update_count += 1
+        alpha = self._compute_alpha()
+        self.delay = max(
+            self.min_delay,
+            min(
+                self.max_delay,
+                (alpha * new_target) + ((1 - alpha) * self.delay)
+            )
+        )
+
+    def on_success(self):
+        target = self.delay * 0.9
+        self._apply_ema(target)
+
+    def on_rate_limit(self):
+        target = self.delay * 2.0
+        self._apply_ema(target)
+        print(f"[429] Rate limited. Sleeping {self.delay:.2f}s...")
+        self.sleep()
+
+    def sleep(self):
+        time.sleep(self.delay)
+
+    def request(self, make_request_fn, params, max_attempts=5):
+        for attempt in range(max_attempts):
+            try:
+                result = make_request_fn(params)
+                self.on_success()
+                return result
+            except HTTPError as e:
+                if e.response.status_code == TOO_MANY_REQUESTS_STATUS_CODE:
+                    self.on_rate_limit()
+                else:
+                    raise
+        return make_request_fn(params)
+
 
 class DistrictAndRep(BaseModel):
     district_number: Optional[int] = None
@@ -45,10 +111,10 @@ def add_if_dont_exist(existing: list, new: list):
         if item not in existing:
             existing.append(item)
 
-def process_row(df: pd.DataFrame, idx):
+def process_row(df: pd.DataFrame, idx, rate_limiter):
     row = df.iloc[idx]
     address = row['address']
-    districts = get_legislative_districts(address)
+    districts = get_legislative_districts(address, rate_limiter)
     if districts.state_house is not None:
         df.at[idx, 'State House District'] = district_name(districts.state_house, 'House')
         df.at[idx, 'State House Rep.'] = districts.state_house.representative_name
@@ -69,10 +135,14 @@ def process_csv(file_path):
         df[state_house_rep_column] = pd.NA  # or None, or "" if working with strings
     mask = df[state_house_rep_column].isna()
 
+    rate_limiter = AdaptiveRateLimiter()
     # Apply with progress bar
     try:
         for idx in tqdm(df[mask].index):
-            process_row(df, idx)
+            if should_stop:
+                break
+            process_row(df, idx, rate_limiter)
+            rate_limiter.sleep()
     except Exception as e:
         df.to_csv(file_path, index=False)
         raise e
@@ -82,15 +152,12 @@ def process_csv(file_path):
 
 
 
-def get_legislative_districts(address) -> RowItem:
+def get_legislative_districts(address, rate_limiter: AdaptiveRateLimiter) -> RowItem:
     params = {
         'key': API_KEY,
         'address': address,
     }
-
-    response = requests.get(BASE_URL, params=params)
-    response.raise_for_status()
-    data = response.json()
+    data = rate_limiter.request(make_request, params)
 
     divisions = data.get('divisions', {})
 
@@ -105,5 +172,12 @@ def get_legislative_districts(address) -> RowItem:
 
     return row_item
 
+def make_request(params) -> dict:
+    response = requests.get(BASE_URL, params=params)
+    response.raise_for_status()
+    return response.json()
+
+
+
 if __name__ == '__main__':
-    process_csv('data/unregistered_addresses.csv')
+    process_csv('data/registered_addresses.csv')
